@@ -15,6 +15,10 @@ import os
 plt.rcParams["font.family"] = ["SimHei", "WenQuanYi Micro Hei", "Heiti TC"]
 plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
 
+# 设置随机种子
+torch.manual_seed(42)
+np.random.seed(42)
+
 # 加载数据
 df = pd.read_csv('E:\\aiSummerCamp2025-master\\aiSummerCamp2025-master\\day3\\assignment\\data\\household_power_consumption.zip', sep=";")
 
@@ -45,7 +49,6 @@ train, val, test = df.loc[df.index <= '2009-09-30'], df.loc[(df.index > '2009-09
 print(f"训练集大小：{len(train)}，验证集大小：{len(val)}，测试集大小：{len(test)}")
 
 # 数据标准化
-# 只对数值特征进行标准化
 numeric_features = [col for col in df.columns if col != 'datetime']
 scaler = StandardScaler()
 train_scaled = scaler.fit_transform(train[numeric_features])
@@ -54,23 +57,14 @@ test_scaled = scaler.transform(test[numeric_features])
 
 # 为LSTM准备数据
 def create_sequences(data, seq_length):
-    """
-    将时间序列数据转换为适合LSTM的序列数据
-    参数:
-        data: 输入的时间序列数据
-        seq_length: 序列长度
-    返回:
-        X: 特征序列
-        y: 目标值
-    """
     X, y = [], []
     for i in range(len(data) - seq_length):
         X.append(data[i:i+seq_length])
         y.append(data[i+seq_length, 0])  # 预测全局活动功率（第一列）
     return np.array(X), np.array(y)
 
-# 设置序列长度
-seq_length = 48  # 使用前48个时间步预测下一个时间步
+# 优化：减少序列长度
+seq_length = 24  # 原48
 
 # 创建训练、验证和测试序列
 X_train, y_train = create_sequences(train_scaled, seq_length)
@@ -93,12 +87,13 @@ class TimeSeriesDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
-# 创建数据加载器
+# 优化：增大批次大小
+batch_size = 128  # 原64
+
 train_dataset = TimeSeriesDataset(X_train, y_train)
 val_dataset = TimeSeriesDataset(X_val, y_val)
 test_dataset = TimeSeriesDataset(X_test, y_test)
 
-batch_size = 64
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
@@ -110,10 +105,9 @@ class LSTMModel(nn.Module):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         
-        # LSTM层
+        # 优化：减少层数
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
         
-        # 全连接层
         self.fc = nn.Sequential(
             nn.Linear(hidden_size, 64),
             nn.ReLU(),
@@ -122,21 +116,17 @@ class LSTMModel(nn.Module):
         )
         
     def forward(self, x):
-        # 初始化隐藏状态
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
         
-        # LSTM前向传播
         out, _ = self.lstm(x, (h0, c0))
-        
-        # 只取序列的最后一个时间步的输出
         out = self.fc(out[:, -1, :])
         return out
 
-# 初始化模型
-input_size = X_train.shape[2]  # 特征数量
-hidden_size = 128
-num_layers = 2
+# 优化：减少隐藏层大小和层数
+input_size = X_train.shape[2]
+hidden_size = 64  # 原128
+num_layers = 1    # 原2
 output_size = 1
 dropout = 0.2
 
@@ -182,9 +172,8 @@ class EarlyStopping:
         torch.save(model.state_dict(), self.path)
         self.val_loss_min = val_loss
 
-# 训练模型
+# 训练模型 - 优化：添加混合精度训练
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, epochs=10, patience=5):
-    # 创建保存模型的目录
     if not os.path.exists('models'):
         os.makedirs('models')
     
@@ -194,29 +183,40 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     train_losses = []
     val_losses = []
     
+    # 启用混合精度训练
+    if device.type == 'cuda':
+        from torch.cuda.amp import autocast, GradScaler
+        scaler = GradScaler()
+    
     for epoch in range(epochs):
         # 训练阶段
         train_loss = 0
         model.train()
         
-        # 创建训练进度条
         train_progress = tqdm(enumerate(train_loader), total=len(train_loader), desc=f'Epoch {epoch+1}/{epochs} [Train]')
         
         for i, (X_batch, y_batch) in train_progress:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             
-            # 前向传播
-            outputs = model(X_batch).squeeze()
-            loss = criterion(outputs, y_batch)
-            
-            # 反向传播和优化
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # 使用混合精度
+            if device.type == 'cuda':
+                with autocast():
+                    outputs = model(X_batch).squeeze()
+                    loss = criterion(outputs, y_batch)
+                
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(X_batch).squeeze()
+                loss = criterion(outputs, y_batch)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
             
             train_loss += loss.item()
-            
-            # 更新进度条信息
             train_progress.set_postfix({'loss': loss.item()})
         
         # 计算平均训练损失
@@ -227,20 +227,16 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         val_loss = 0
         model.eval()
         
-        # 创建验证进度条
         val_progress = tqdm(enumerate(val_loader), total=len(val_loader), desc=f'Epoch {epoch+1}/{epochs} [Val]')
         
         with torch.no_grad():
             for i, (X_batch, y_batch) in val_progress:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 
-                # 预测
                 outputs = model(X_batch).squeeze()
                 loss = criterion(outputs, y_batch)
                 
                 val_loss += loss.item()
-                
-                # 更新进度条信息
                 val_progress.set_postfix({'loss': loss.item()})
         
         # 计算平均验证损失
@@ -275,9 +271,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     
     return model
 
-# 训练模型
+# 优化：减少训练轮数
 print("开始训练模型...")
-model = train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, epochs=30, patience=5)
+model = train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, epochs=15, patience=3)
 
 # 评估模型
 def evaluate_model(model, test_loader, criterion, device):
@@ -286,23 +282,19 @@ def evaluate_model(model, test_loader, criterion, device):
     actuals = []
     total_loss = 0
     
-    # 创建测试进度条
     test_progress = tqdm(enumerate(test_loader), total=len(test_loader), desc='Testing')
     
     with torch.no_grad():
         for i, (X_batch, y_batch) in test_progress:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             
-            # 预测
             outputs = model(X_batch).squeeze()
             loss = criterion(outputs, y_batch)
             total_loss += loss.item()
             
-            # 保存预测和实际值
             predictions.extend(outputs.cpu().numpy())
             actuals.extend(y_batch.cpu().numpy())
             
-            # 更新进度条信息
             test_progress.set_postfix({'loss': loss.item()})
     
     # 计算评估指标
@@ -322,7 +314,6 @@ print("开始评估模型...")
 predictions, actuals = evaluate_model(model, test_loader, criterion, device)
 
 # 反标准化预测值和实际值
-# 复制一个标准化器来处理预测结果
 pred_scaler = StandardScaler()
 pred_scaler.mean_ = scaler.mean_[0]
 pred_scaler.scale_ = scaler.scale_[0]
